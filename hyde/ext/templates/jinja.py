@@ -8,6 +8,7 @@ import os
 import re
 import itertools
 from urllib import quote, unquote
+import cStringIO
 
 from hyde.fs import File, Folder
 from hyde.model import Expando
@@ -20,6 +21,24 @@ from jinja2 import FileSystemLoader, FileSystemBytecodeCache
 from jinja2 import contextfilter, environmentfilter, Markup, Undefined, nodes
 from jinja2.ext import Extension
 from jinja2.exceptions import TemplateError
+
+try: # dependencies for ipython filter
+    from IPython import Config, InteractiveShell
+    from IPython.core.profiledir import ProfileDir
+    from IPython.utils import io
+    import tempfile
+    import sys
+    import ast
+except ImportError:
+    has_ipython = False
+
+try:
+    from pygments.lexer import Lexer, do_insertions
+    from pygments.lexers.agile import (PythonConsoleLexer, PythonLexer,
+                                   PythonTracebackLexer)
+    from pygments.token import Comment, Generic
+except:
+    pass # this is checked again in syntax, so don't worry about it
 
 logger = getLoggerWithNullHandler('hyde.engine.Jinja2')
 
@@ -163,6 +182,80 @@ def restructuredtext(env, value):
     parts = publish_parts(source=value, writer_name="html")
     return parts['html_body']
 
+class IPythonConsoleLexer(Lexer):
+    """
+    For IPython console output or doctests, such as:
+
+    .. sourcecode:: ipython
+
+      In [1]: a = 'foo'
+
+      In [2]: a
+      Out[2]: 'foo'
+
+      In [3]: print a
+      foo
+
+      In [4]: 1 / 0
+
+    Notes:
+
+      - Tracebacks are not currently supported.
+
+      - It assumes the default IPython prompts, not customized ones.
+    """
+
+    name = 'IPython console session'
+    aliases = ['ipython']
+    mimetypes = ['text/x-ipython-console']
+    input_prompt = re.compile("(In \[[0-9]+\]: )|(   \.\.\.+:)")
+    output_prompt = re.compile("(Out\[[0-9]+\]: )|(   \.\.\.+:)")
+    continue_prompt = re.compile("   \.\.\.+:")
+    tb_start = re.compile("\-+")
+
+    def get_tokens_unprocessed(self, text):
+        pylexer = PythonLexer(**self.options)
+        tblexer = PythonTracebackLexer(**self.options)
+
+        curcode = ''
+        insertions = []
+        line_re = re.compile('.*?\n')
+        for match in line_re.finditer(text):
+            line = match.group()
+            input_prompt = self.input_prompt.match(line)
+            continue_prompt = self.continue_prompt.match(line.rstrip())
+            output_prompt = self.output_prompt.match(line)
+            if line.startswith("#"):
+                insertions.append((len(curcode),
+                                   [(0, Comment, line)]))
+            elif input_prompt is not None:
+                insertions.append((len(curcode),
+                                   [(0, Generic.Prompt, input_prompt.group())]))
+                curcode += line[input_prompt.end():]
+            elif continue_prompt is not None:
+                insertions.append((len(curcode),
+                                   [(0, Generic.Prompt, continue_prompt.group())]))
+                curcode += line[continue_prompt.end():]
+            elif output_prompt is not None:
+                # Use the 'error' token for output.  We should probably make
+                # our own token, but error is typicaly in a bright color like
+                # red, so it works fine for our output prompts.
+                insertions.append((len(curcode),
+                                   [(0, Generic.Error, output_prompt.group())]))
+                curcode += line[output_prompt.end():]
+            else:
+                if curcode:
+                    for item in do_insertions(insertions,
+                                              pylexer.get_tokens_unprocessed(curcode)):
+                        yield item
+                        curcode = ''
+                        insertions = []
+                yield match.start(), Generic.Output, line
+        if curcode:
+            for item in do_insertions(insertions,
+                                      pylexer.get_tokens_unprocessed(curcode)):
+                yield item
+
 @environmentfilter
 def syntax(env, value, lexer=None, filename=None):
     """
@@ -177,7 +270,10 @@ def syntax(env, value, lexer=None, filename=None):
                         " use syntax highlighting tags.")
         raise TemplateError("Cannot load pygments")
 
-    pyg = (lexers.get_lexer_by_name(lexer)
+    if lexer == 'ipython': # not sure how else to register the syntax
+        pyg = IPythonConsoleLexer()
+    else:
+        pyg = (lexers.get_lexer_by_name(lexer)
                 if lexer else
                     lexers.guess_lexer(value))
     settings = {}
@@ -196,6 +292,578 @@ def syntax(env, value, lexer=None, filename=None):
     return Markup(
             '<div class="codebox"><figure class="code">%s<figcaption>%s</figcaption></figure></div>\n\n'
                         % (code, caption))
+
+def ipythonsyntax(env, val):
+    """
+    I don't know how else to monkey-patch pygments to get this custom lexer in.
+    """
+    try:
+        pass
+    except:
+        pass
+
+class EmbeddedJinjaShell(object):
+    """An embedded IPython instance to run inside Jinja"""
+
+    def __init__(self):
+
+        self.cout = cStringIO.StringIO()
+
+        # for tokenizing blocks
+        self.COMMENT, self.INPUT, self.OUTPUT = range(3)
+
+
+        # Create config object for IPython
+        config = Config()
+        config.Global.display_banner = False
+        config.Global.exec_lines = ['import numpy as np',
+                                    'from pylab import *'
+                                    ]
+        config.InteractiveShell.autocall = False
+        config.InteractiveShell.autoindent = False
+        config.InteractiveShell.colors = 'NoColor'
+
+        # create a profile so instance history isn't saved
+        tmp_profile_dir = tempfile.mkdtemp(prefix='profile_')
+        profname = 'auto_profile_jinja_build'
+        pdir = os.path.join(tmp_profile_dir,profname)
+        profile = ProfileDir.create_profile_dir(pdir)
+
+        # Create and initialize ipython, but don't start its mainloop
+        IP = InteractiveShell.instance(config=config, profile_dir=profile)
+        # io.stdout redirect must be done *after* instantiating InteractiveShell
+        io.stdout = self.cout
+        io.stderr = self.cout
+
+        # For debugging, so we can see normal output, use this:
+        #from IPython.utils.io import Tee
+        #io.stdout = Tee(self.cout, channel='stdout') # dbg
+        #io.stderr = Tee(self.cout, channel='stderr') # dbg
+
+        # Store a few parts of IPython we'll need.
+        self.IP = IP
+        self.user_ns = self.IP.user_ns
+        self.user_global_ns = self.IP.user_global_ns
+
+        self.input = ''
+        self.output = ''
+
+        self.is_verbatim = False
+        self.is_doctest = False
+        self.is_suppress = False
+
+        # on the first call to the savefig decorator, we'll import
+        # pyplot as plt so we can make a call to the plt.gcf().savefig
+        self._pyplot_imported = False
+
+    def clear_cout(self):
+        self.cout.seek(0)
+        self.cout.truncate(0)
+
+    def block_parser(self, part, rgxin, rgxout, fmtin, fmtout):
+        """
+        part is a string of ipython text, comprised of at most one
+        input, one ouput, comments, and blank lines.  The block parser
+        parses the text into a list of::
+
+          blocks = [ (TOKEN0, data0), (TOKEN1, data1), ...]
+
+        where TOKEN is one of [COMMENT | INPUT | OUTPUT ] and
+        data is, depending on the type of token::
+
+          COMMENT : the comment string
+
+          INPUT: the (DECORATOR, INPUT_LINE, REST) where
+             DECORATOR: the input decorator (or None)
+             INPUT_LINE: the input as string (possibly multi-line)
+             REST : any stdout generated by the input line (not OUTPUT)
+
+
+          OUTPUT: the output string, possibly multi-line
+        """
+
+        block = []
+        lines = part.split('\n')
+        N = len(lines)
+        i = 0
+        decorator = None
+        while 1:
+
+            if i==N:
+                # nothing left to parse -- the last line
+                break
+
+            line = lines[i]
+            i += 1
+            line_stripped = line.strip()
+            if line_stripped.startswith('#'):
+                block.append((self.COMMENT, line))
+                continue
+
+            if line_stripped.startswith('@'):
+                # we're assuming at most one decorator -- may need to
+                # rethink
+                decorator = line_stripped
+                continue
+
+            # does this look like an input line?
+            matchin = rgxin.match(line)
+            if matchin:
+                lineno, inputline = int(matchin.group(1)), matchin.group(2)
+
+                # the ....: continuation string
+                continuation = '   %s:'% ''.join(['.']*(len(str(lineno))+2))
+                Nc = len(continuation)
+                # input lines can continue on for more than one line, if
+                # we have a '\' line continuation char or a function call
+                # echo line 'print'.  The input line can only be
+                # terminated by the end of the block or an output line, so
+                # we parse out the rest of the input line if it is
+                # multiline as well as any echo text
+
+                rest = []
+                while i<N:
+
+                    # look ahead; if the next line is blank, or a comment, or
+                    # an output line, we're done
+
+                    nextline = lines[i]
+                    matchout = rgxout.match(nextline)
+                    #print "nextline=%s, continuation=%s, starts=%s"%(nextline, continuation, nextline.startswith(continuation))
+                    if matchout or nextline.startswith('#'):
+                        break
+                    elif nextline.startswith(continuation):
+                        inputline += '\n' + nextline[Nc:]
+                    else:
+                        rest.append(nextline)
+                    i+= 1
+
+                block.append((self.INPUT, (decorator, inputline, '\n'.join(rest))))
+                continue
+
+            # if it looks like an output line grab all the text to the end
+            # of the block
+            matchout = rgxout.match(line)
+            if matchout:
+                lineno, output = int(matchout.group(1)), matchout.group(2)
+                if i<N-1:
+                    output = '\n'.join([output] + lines[i:])
+
+                block.append((self.OUTPUT, output))
+                break
+
+        return block
+
+    def process_input_line(self, line, store_history=True):
+        """process the input, capturing stdout"""
+        #print "input='%s'"%self.input
+        stdout = sys.stdout
+        splitter = self.IP.input_splitter
+        try:
+            sys.stdout = self.cout
+            splitter.push(line)
+            more = splitter.push_accepts_more()
+            if not more:
+                source_raw = splitter.source_raw_reset()[1]
+                self.IP.run_cell(source_raw, store_history=store_history)
+        finally:
+            sys.stdout = stdout
+
+    def process_image(self, decorator):
+        """
+        # build out an image directive like
+        # .. image:: somefile.png
+        #    :width 4in
+        #
+        # from an input like
+        # savefig somefile.png width=4in
+        """
+        savefig_dir = self.savefig_dir
+        source_dir = self.source_dir
+        saveargs = decorator.split(' ')
+        filename = saveargs[1]
+        # insert relative path to image file in source
+        outfile = os.path.relpath(os.path.join(savefig_dir,filename),
+                    source_dir)
+
+        imagerows = ['.. image:: %s'%outfile]
+
+        for kwarg in saveargs[2:]:
+            arg, val = kwarg.split('=')
+            arg = arg.strip()
+            val = val.strip()
+            imagerows.append('   :%s: %s'%(arg, val))
+
+        image_file = os.path.basename(outfile) # only return file name
+        image_directive = '\n'.join(imagerows)
+        return image_file, image_directive
+
+
+    # Callbacks for each type of token
+    def process_input(self, data, input_prompt, lineno):
+        """Process data block for INPUT token."""
+        decorator, input, rest = data
+        image_file = None
+        image_directive = None
+        #print 'INPUT:', data  # dbg
+        is_verbatim = decorator=='@verbatim' or self.is_verbatim
+        is_doctest = decorator=='@doctest' or self.is_doctest
+        is_suppress = decorator=='@suppress' or self.is_suppress
+        is_savefig = decorator is not None and \
+                     decorator.startswith('@savefig')
+
+        input_lines = input.split('\n')
+
+        continuation = '   %s:'%''.join(['.']*(len(str(lineno))+2))
+        Nc = len(continuation)
+
+        if is_savefig:
+            image_file, image_directive = self.process_image(decorator)
+
+        ret = []
+        is_semicolon = False
+        store_history = True
+
+        for i, line in enumerate(input_lines):
+            if line.endswith(';'):
+                is_semicolon = True
+            if is_semicolon or is_suppress:
+                store_history = False
+
+            if i==0:
+                # process the first input line
+                if is_verbatim:
+                    self.process_input_line('')
+                    self.IP.execution_count += 1 # increment it anyway
+                else:
+                    # only submit the line in non-verbatim mode
+                    self.process_input_line(line, store_history=store_history)
+                formatted_line = '%s %s'%(input_prompt, line)
+            else:
+                # process a continuation line
+                if not is_verbatim:
+                    self.process_input_line(line, store_history=store_history)
+
+                formatted_line = '%s%s'%(continuation, line)
+
+            if not is_suppress:
+                ret.append(formatted_line)
+
+        if not is_suppress:
+            if len(rest.strip()):
+                if is_verbatim:
+                    # the "rest" is the standard output of the
+                    # input, which needs to be added in
+                    # verbatim mode
+                    ret.append(rest)
+
+        self.cout.seek(0)
+        output = self.cout.read()
+        if not is_suppress and not is_semicolon:
+            ret.append(output)
+
+        self.cout.truncate(0)
+        return (ret, input_lines, output, is_doctest, image_file,
+                    image_directive)
+        #print 'OUTPUT', output  # dbg
+
+    def process_output(self, data, output_prompt,
+                       input_lines, output, is_doctest, image_file):
+        """Process data block for OUTPUT token."""
+        if is_doctest:
+            submitted = data.strip()
+            found = output
+            if found is not None:
+                found = found.strip()
+
+                # XXX - fperez: in 0.11, 'output' never comes with the prompt
+                # in it, just the actual output text.  So I think all this code
+                # can be nuked...
+
+                # the above comment does not appear to be accurate... (minrk)
+
+                ind = found.find(output_prompt)
+                if ind<0:
+                    e='output prompt="%s" does not match out line=%s' % \
+                       (output_prompt, found)
+                    raise RuntimeError(e)
+                found = found[len(output_prompt):].strip()
+
+                if found!=submitted:
+                    e = ('doctest failure for input_lines="%s" with '
+                         'found_output="%s" and submitted output="%s"' %
+                         (input_lines, found, submitted) )
+                    raise RuntimeError(e)
+                #print 'doctest PASSED for input_lines="%s" with found_output="%s" and submitted output="%s"'%(input_lines, found, submitted)
+
+    def process_comment(self, data):
+        """Process data fPblock for COMMENT token."""
+        if not self.is_suppress:
+            return [data]
+
+    def save_image(self, image_file):
+        """
+        Saves the image file to disk.
+        """
+        self.ensure_pyplot()
+        command = ('plt.gcf().savefig("%s", bbox_inches="tight", '
+                   'dpi=100)' % image_file)
+        #print 'SAVEFIG', command  # dbg
+        self.process_input_line('bookmark ipy_thisdir', store_history=False)
+        self.process_input_line('cd -b ipy_savedir', store_history=False)
+        self.process_input_line(command, store_history=False)
+        self.process_input_line('cd -b ipy_thisdir', store_history=False)
+        self.process_input_line('bookmark -d ipy_thisdir', store_history=False)
+        self.clear_cout()
+
+
+    def process_block(self, block):
+        """
+        process block from the block_parser and return a list of processed lines
+        """
+        ret = []
+        output = None
+        input_lines = None
+        lineno = self.IP.execution_count
+
+        input_prompt = self.promptin%lineno
+        output_prompt = self.promptout%lineno
+        image_file = None
+        image_directive = None
+
+        for token, data in block:
+            if token==self.COMMENT:
+                out_data = self.process_comment(data)
+            elif token==self.INPUT:
+                (out_data, input_lines, output, is_doctest, image_file,
+                    image_directive) = \
+                          self.process_input(data, input_prompt, lineno)
+            elif token==self.OUTPUT:
+                out_data = \
+                    self.process_output(data, output_prompt,
+                                        input_lines, output, is_doctest,
+                                        image_file)
+            if out_data:
+                ret.extend(out_data)
+
+        # save the image files
+        if image_file is not None:
+            self.save_image(image_file)
+
+        return ret, image_directive
+
+    def ensure_pyplot(self):
+        if self._pyplot_imported:
+            return
+        self.process_input_line('import matplotlib.pyplot as plt',
+                                store_history=False)
+
+    def process_pure_python(self, content):
+        """
+        content is a list of strings. it is unedited directive conent
+
+        This runs it line by line in the InteractiveShell, prepends
+        prompts as needed capturing stderr and stdout, then returns
+        the content as a list as if it were ipython code
+        """
+        output = []
+        savefig = False # keep up with this to clear figure
+        multiline = False # to handle line continuation
+        fmtin = self.promptin
+
+        for lineno, line in enumerate(content):
+
+            line_stripped = line.strip()
+
+            if not len(line):
+                output.append(line) # preserve empty lines in output
+                continue
+
+            # handle decorators
+            if line_stripped.startswith('@'):
+                output.extend([line])
+                if 'savefig' in line:
+                    savefig = True # and need to clear figure
+                continue
+
+            # handle comments
+            if line_stripped.startswith('#'):
+                output.extend([line])
+                continue
+
+            # deal with multilines
+            if not multiline: # not currently on a multiline
+
+                if line_stripped.endswith('\\'): # now we are
+                    multiline = True
+                    cont_len = len(str(lineno)) + 2
+                    line_to_process = line.strip('\\')
+                    output.extend([u"%s %s" % (fmtin%lineno,line)])
+                    continue
+                else: # no we're still not
+                    line_to_process = line.strip('\\')
+            else: # we are currently on a multiline
+                line_to_process += line.strip('\\')
+                if line_stripped.endswith('\\'): # and we still are
+                    continuation = '.' * cont_len
+                    output.extend([(u'   %s: '+line_stripped) % continuation])
+                    continue
+                # else go ahead and run this multiline then carry on
+
+            # get output of line
+            self.process_input_line(unicode(line_to_process.strip()),
+                                    store_history=False)
+            out_line = self.cout.getvalue()
+            self.clear_cout()
+
+            # clear current figure if plotted
+            if savefig:
+                self.ensure_pyplot()
+                self.process_input_line('plt.clf()', store_history=False)
+                self.clear_cout()
+                savefig = False
+
+            # line numbers don't actually matter, they're replaced later
+            if not multiline:
+                in_line = u"%s %s" % (fmtin%lineno,line)
+
+                output.extend([in_line])
+            else:
+                output.extend([(u'   %s: '+line_stripped) % continuation])
+                multiline = False
+            if len(out_line):
+                output.extend([out_line])
+            output.extend([u''])
+
+        return output
+
+    def process_pure_python2(self, content):
+        """
+        content is a list of strings. it is unedited directive conent
+
+        This runs it line by line in the InteractiveShell, prepends
+        prompts as needed capturing stderr and stdout, then returns
+        the content as a list as if it were ipython code
+        """
+        output = []
+        savefig = False # keep up with this to clear figure
+        multiline = False # to handle line continuation
+        multiline_start = None
+        fmtin = self.promptin
+
+        ct = 0
+
+        for lineno, line in enumerate(content):
+
+            line_stripped = line.strip()
+            if not len(line):
+                output.append(line)
+                continue
+
+            # handle decorators
+            if line_stripped.startswith('@'):
+                output.extend([line])
+                if 'savefig' in line:
+                    savefig = True # and need to clear figure
+                continue
+
+            # handle comments
+            if line_stripped.startswith('#'):
+                output.extend([line])
+                continue
+
+            continuation  = u'   %s:'% ''.join(['.']*(len(str(ct))+2))
+            if not multiline:
+                modified = u"%s %s" % (fmtin % ct, line_stripped)
+                output.append(modified)
+                ct += 1
+                try:
+                    ast.parse(line_stripped)
+                    output.append(u'')
+                except Exception:
+                    multiline = True
+                    multiline_start = lineno
+            else:
+                modified = u'%s %s' % (continuation, line)
+                output.append(modified)
+                try:
+                    ast.parse('\n'.join(content[multiline_start:lineno+1]))
+                    output.append(u'')
+                    multiline = False
+                except Exception:
+                    pass
+
+            continue
+
+        return output
+
+@environmentfilter
+def ipython(env, value, python='python'):
+    """
+    IPython filter.
+    """
+    shell = EmbeddedJinjaShell()
+
+    # setup the shell
+    import re
+
+    if hasattr(env.config, 'ipythontext'):
+        shell.rgxin = getattr(env.config.ipythontext, 'rgxin' ,
+                        re.compile('In \[(\d+)\]:\s?(.*)\s*') )
+        shell.rgxout = getattr(env.config.ipythontext, 'rgxout', 
+                        re.compile('Out\[(\d+)\]:\s?(.*)\s*'))
+        shell.promptin = getattr(env.config.ipythontext, 'promptin', 'In [%d]:')
+        shell.promptout = getattr(env.config.ipythontext, 'promptout', 'Out[%d]:')
+        shell.savefig_dir = getattr(env.config.ipythontext, 'savefig_dir', '')
+    else:
+        shell.rgxin = re.compile('In \[(\d+)\]:\s?(.*)\s*')
+        shell.rgxout = re.compile('Out\[(\d+)\]:\s?(.*)\s*')
+        shell.promptin = 'In [%d]:'
+        shell.promptout = 'Out[%d]:'
+        shell.savefig_dir = ''
+
+    rgxin, rgxout = shell.rgxin, shell.rgxout
+    promptin, promptout = shell.promptin, shell.promptout
+    
+    shell.process_input_line('bookmark ipy_savedir %s' % shell.savefig_dir,
+                                      store_history=False)
+    shell.clear_cout()
+
+    shell.is_suppress = False
+    shell.is_doctest = False
+    shell.is_verbatim = False
+
+    # we need a list
+    content = value.strip().split('\n')
+
+    if python == 'python':
+        content = shell.process_pure_python2(content)
+
+    parts = '\n'.join(content).split('\n\n')
+
+    # this writes rst because I'm too lazy to update it
+    lines = []
+    figures = []
+    
+    for part in parts:
+        block = shell.block_parser(part, rgxin, rgxout, promptin, promptout)
+
+        if len(block):
+            rows, figure = shell.process_block(block)
+            for row in rows:
+                lines.extend(['%s' % line 
+                              for line in re.split('[\n]+', row)])
+            if figure is not None:
+                figures.append(figure)
+
+    for figure in figures:
+        lines.append('')
+        lines.extend(figure.split('\n'))
+        lines.append('')
+
+    text = '\n'.join(lines)
+    
+    return syntax(env, text, 'ipython')
 
 class Spaceless(Extension):
     """
@@ -685,6 +1353,7 @@ class Jinja2Template(Template):
         self.env.filters['xmldatetime'] = xmldatetime
         self.env.filters['islice'] = islice
         self.env.filters['top'] = top
+        self.env.filters['ipython'] = ipython
 
         config = {}
         if hasattr(site, 'config'):
