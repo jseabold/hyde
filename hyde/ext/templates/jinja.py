@@ -293,15 +293,6 @@ def syntax(env, value, lexer=None, filename=None):
             '<div class="codebox"><figure class="code">%s<figcaption>%s</figcaption></figure></div>\n\n'
                         % (code, caption))
 
-def ipythonsyntax(env, val):
-    """
-    I don't know how else to monkey-patch pygments to get this custom lexer in.
-    """
-    try:
-        pass
-    except:
-        pass
-
 class EmbeddedJinjaShell(object):
     """An embedded IPython instance to run inside Jinja"""
 
@@ -575,13 +566,6 @@ class EmbeddedJinjaShell(object):
             found = output
             if found is not None:
                 found = found.strip()
-
-                # XXX - fperez: in 0.11, 'output' never comes with the prompt
-                # in it, just the actual output text.  So I think all this code
-                # can be nuked...
-
-                # the above comment does not appear to be accurate... (minrk)
-
                 ind = found.find(output_prompt)
                 if ind<0:
                     e='output prompt="%s" does not match out line=%s' % \
@@ -798,11 +782,17 @@ class EmbeddedJinjaShell(object):
         return output
 
 @environmentfilter
-def ipython(env, value, python='python'):
+def ipython(env, value):
     """
     IPython filter.
     """
     shell = EmbeddedJinjaShell()
+    old_exec_count = [i for i in os.listdir(tempfile.tempdir) 
+                      if i.startswith('exec_count')]
+    if old_exec_count:
+        fname = os.path.join(tempfile.tempdir, old_exec_count[0])
+        shell.IP.execution_count -= int(open(fname).read()) + 1
+        os.remove(fname)
 
     # setup the shell
     import re
@@ -814,13 +804,14 @@ def ipython(env, value, python='python'):
                         re.compile('Out\[(\d+)\]:\s?(.*)\s*'))
         shell.promptin = getattr(env.config.ipythontext, 'promptin', 'In [%d]:')
         shell.promptout = getattr(env.config.ipythontext, 'promptout', 'Out[%d]:')
-        shell.savefig_dir = getattr(env.config.ipythontext, 'savefig_dir', '')
+        shell.savefig_dir = getattr(env.config.ipythontext, 'savefig_dir', 
+                            env.config.media_url)
     else:
         shell.rgxin = re.compile('In \[(\d+)\]:\s?(.*)\s*')
         shell.rgxout = re.compile('Out\[(\d+)\]:\s?(.*)\s*')
         shell.promptin = 'In [%d]:'
         shell.promptout = 'Out[%d]:'
-        shell.savefig_dir = ''
+        shell.savefig_dir = env.config.media_url
 
     rgxin, rgxout = shell.rgxin, shell.rgxout
     promptin, promptout = shell.promptin, shell.promptout
@@ -836,15 +827,15 @@ def ipython(env, value, python='python'):
     # we need a list
     content = value.strip().split('\n')
 
-    if python == 'python':
-        content = shell.process_pure_python2(content)
-
+    #NOTE: this assumes we've gotten pure python, but doesn't need to be 
+    # run if it's an IPython session that's copy pasted
+    content = shell.process_pure_python2(content)
+    
     parts = '\n'.join(content).split('\n\n')
 
     # this writes rst because I'm too lazy to update it
     lines = []
     figures = []
-    
     for part in parts:
         block = shell.block_parser(part, rgxin, rgxout, promptin, promptout)
 
@@ -863,6 +854,13 @@ def ipython(env, value, python='python'):
 
     text = '\n'.join(lines)
     
+    # save execution count, don't know why hyde runs this all twice
+    # this is going to cause problems for mutable objects re-used in state
+    # if they change
+    fd, fname = tempfile.mkstemp(prefix="exec_count", text=True)
+    with open(fname, 'w') as fout:
+        fout.write(str(shell.IP.execution_count))
+
     return syntax(env, text, 'ipython')
 
 class Spaceless(Extension):
