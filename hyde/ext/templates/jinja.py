@@ -791,7 +791,8 @@ def ipython(env, value):
                       if i.startswith('exec_count')]
     if old_exec_count:
         fname = os.path.join(tempfile.tempdir, old_exec_count[0])
-        shell.IP.execution_count -= int(open(fname).read()) + 1
+        shell.IP.history_manager.reset()
+        shell.IP.execution_count -= (int(open(fname).read()) - 1)
         os.remove(fname)
 
     # setup the shell
