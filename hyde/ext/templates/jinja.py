@@ -507,6 +507,10 @@ class EmbeddedJinjaShell(object):
                      decorator.startswith('@savefig')
 
         input_lines = input.split('\n')
+        if len(input_lines) > 1:
+            if input_lines[-1] != "":
+                input_lines.append('') # make sure there's blank line
+                                       # so splitter buffer gets reset
 
         continuation = '   %s:'%''.join(['.']*(len(str(lineno))+2))
         Nc = len(continuation)
@@ -542,13 +546,11 @@ class EmbeddedJinjaShell(object):
             if not is_suppress:
                 ret.append(formatted_line)
 
-        if not is_suppress:
-            if len(rest.strip()):
-                if is_verbatim:
-                    # the "rest" is the standard output of the
-                    # input, which needs to be added in
-                    # verbatim mode
-                    ret.append(rest)
+        if not is_suppress and len(rest.strip()) and is_verbatim:
+            # the "rest" is the standard output of the
+            # input, which needs to be added in
+            # verbatim mode
+            ret.append(rest)
 
         self.cout.seek(0)
         output = self.cout.read()
