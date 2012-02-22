@@ -286,6 +286,11 @@ def syntax(env, value, lexer=None, filename=None):
     code = pygments.highlight(value, pyg, formatter)
     code = code.replace('\n\n', '\n&nbsp;\n').replace('\n', '<br />')
     caption = filename if filename else pyg.name
+    if lexer == 'ipython': # deal with images in ipython syntax, also put them
+                           # in facebox, this should be done in javascript
+                           # at the DOM level...
+        pat = "(&lt;img src=&quot;)(.+)(&quot; /&gt;)"
+        code = re.sub(pat, "<a href = \"\\2\" rel=\"facebox\"><img src=\"\\2\" /></a>", code)
     if hasattr(env.config, 'syntax'):
         if not getattr(env.config.syntax, 'use_figure', True):
             return Markup(code)
@@ -463,21 +468,19 @@ class EmbeddedJinjaShell(object):
     def process_image(self, decorator):
         """
         # build out an image directive like
-        # .. image:: somefile.png
+        # ![Alt text](somefile.png)
         #    :width 4in
         #
         # from an input like
         # savefig somefile.png width=4in
         """
         savefig_dir = self.savefig_dir
-        source_dir = self.source_dir
         saveargs = decorator.split(' ')
         filename = saveargs[1]
         # insert relative path to image file in source
-        outfile = os.path.relpath(os.path.join(savefig_dir,filename),
-                    source_dir)
+        outfile = '/' + os.path.join(savefig_dir,filename)
 
-        imagerows = ['.. image:: %s'%outfile]
+        imagerows = ['<img src="%s" />'%outfile]
 
         for kwarg in saveargs[2:]:
             arg, val = kwarg.split('=')
@@ -518,7 +521,7 @@ class EmbeddedJinjaShell(object):
         for i, line in enumerate(input_lines):
             if line.endswith(';'):
                 is_semicolon = True
-            if is_semicolon or is_suppress:
+            if is_suppress:
                 store_history = False
 
             if i==0:
@@ -552,6 +555,8 @@ class EmbeddedJinjaShell(object):
         output = self.cout.read()
         if not is_suppress and not is_semicolon:
             ret.append(output)
+        elif is_semicolon: # to get the spacing right
+            ret.append('')
 
         self.cout.truncate(0)
         return (ret, input_lines, output, is_doctest, image_file,
@@ -589,6 +594,11 @@ class EmbeddedJinjaShell(object):
         """
         Saves the image file to disk.
         """
+        image_dir = os.path.join(self.source_dir,
+                                 self.content_dir,
+                                 self.savefig_dir)
+        image_file = os.path.join(image_dir, image_file)
+        print "Saving image to %s" % image_file
         self.ensure_pyplot()
         command = ('plt.gcf().savefig("%s", bbox_inches="tight", '
                    'dpi=100)' % image_file)
@@ -777,6 +787,12 @@ class EmbeddedJinjaShell(object):
                 except Exception:
                     pass
 
+            if savefig: # clear figure if plotted
+                self.ensure_pyplot()
+                self.process_input_line('plt.clf()', store_history=False)
+                self.clear_cout()
+                savefig = False
+
             continue
 
         return output
@@ -787,7 +803,7 @@ def ipython(env, value):
     IPython filter.
     """
     shell = EmbeddedJinjaShell()
-    old_exec_count = [i for i in os.listdir(tempfile.tempdir) 
+    old_exec_count = [i for i in os.listdir(tempfile.tempdir)
                       if i.startswith('exec_count')]
     if old_exec_count:
         fname = os.path.join(tempfile.tempdir, old_exec_count[0])
@@ -801,22 +817,28 @@ def ipython(env, value):
     if hasattr(env.config, 'ipythontext'):
         shell.rgxin = getattr(env.config.ipythontext, 'rgxin' ,
                         re.compile('In \[(\d+)\]:\s?(.*)\s*') )
-        shell.rgxout = getattr(env.config.ipythontext, 'rgxout', 
+        shell.rgxout = getattr(env.config.ipythontext, 'rgxout',
                         re.compile('Out\[(\d+)\]:\s?(.*)\s*'))
         shell.promptin = getattr(env.config.ipythontext, 'promptin', 'In [%d]:')
         shell.promptout = getattr(env.config.ipythontext, 'promptout', 'Out[%d]:')
-        shell.savefig_dir = getattr(env.config.ipythontext, 'savefig_dir', 
+        shell.savefig_dir = getattr(env.config.ipythontext, 'savefig_dir',
                             env.config.media_url)
     else:
         shell.rgxin = re.compile('In \[(\d+)\]:\s?(.*)\s*')
         shell.rgxout = re.compile('Out\[(\d+)\]:\s?(.*)\s*')
         shell.promptin = 'In [%d]:'
         shell.promptout = 'Out[%d]:'
-        shell.savefig_dir = env.config.media_url
+        shell.savefig_dir = os.path.join(env.config.media_url[1:],
+                                         'img/')
+        shell.content_dir = env.config.content_root
+
+    shell.source_dir = env.config.sitepath.path
+
 
     rgxin, rgxout = shell.rgxin, shell.rgxout
     promptin, promptout = shell.promptin, shell.promptout
-    
+
+
     shell.process_input_line('bookmark ipy_savedir %s' % shell.savefig_dir,
                                       store_history=False)
     shell.clear_cout()
@@ -828,10 +850,10 @@ def ipython(env, value):
     # we need a list
     content = value.strip().split('\n')
 
-    #NOTE: this assumes we've gotten pure python, but doesn't need to be 
+    #NOTE: this assumes we've gotten pure python, but doesn't need to be
     # run if it's an IPython session that's copy pasted
     content = shell.process_pure_python2(content)
-    
+
     parts = '\n'.join(content).split('\n\n')
 
     # this writes rst because I'm too lazy to update it
@@ -843,7 +865,7 @@ def ipython(env, value):
         if len(block):
             rows, figure = shell.process_block(block)
             for row in rows:
-                lines.extend(['%s' % line 
+                lines.extend(['%s' % line
                               for line in re.split('[\n]+', row)])
             if figure is not None:
                 figures.append(figure)
@@ -854,7 +876,7 @@ def ipython(env, value):
         lines.append('')
 
     text = '\n'.join(lines)
-    
+
     # save execution count, don't know why hyde runs this all twice
     # this is going to cause problems for mutable objects re-used in state
     # if they change
