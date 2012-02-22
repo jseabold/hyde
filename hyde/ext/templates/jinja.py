@@ -539,7 +539,6 @@ class EmbeddedJinjaShell(object):
                     self.process_input_line(line, store_history=store_history)
 
                 formatted_line = '%s%s'%(continuation, line)
-
             if not is_suppress:
                 ret.append(formatted_line)
 
@@ -777,13 +776,22 @@ class EmbeddedJinjaShell(object):
                 except Exception:
                     multiline = True
                     multiline_start = lineno
+                    if line_stripped.startswith('def '):
+                        is_function = True
             else:
                 modified = u'%s %s' % (continuation, line)
                 output.append(modified)
                 try:
-                    ast.parse('\n'.join(content[multiline_start:lineno+1]))
-                    output.append(u'')
-                    multiline = False
+                    mod = ast.parse(
+                            '\n'.join(content[multiline_start:lineno+1]))
+                    if isinstance(mod.body[0], ast.FunctionDef):
+                        # check to see if we have the whole function
+                        for element in mod.body[0].body:
+                            if isinstance(element, ast.Return):
+                                multiline = False
+                    else:
+                        output.append(u'')
+                        multiline = False
                 except Exception:
                     pass
 
@@ -792,8 +800,6 @@ class EmbeddedJinjaShell(object):
                 self.process_input_line('plt.clf()', store_history=False)
                 self.clear_cout()
                 savefig = False
-
-            continue
 
         return output
 
