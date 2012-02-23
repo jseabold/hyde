@@ -289,7 +289,7 @@ def syntax(env, value, lexer=None, filename=None):
     if lexer == 'ipython': # deal with images in ipython syntax, also put them
                            # in facebox, this should be done in javascript
                            # at the DOM level...
-        pat = "(&lt;img src=&quot;)(.+)(&quot; /&gt;)"
+        pat = "(&lt;img src=&quot;)(.+?)(&quot; /&gt;)"
         code = re.sub(pat, "<a href = \"\\2\" rel=\"facebox\"><img src=\"\\2\" /></a>", code)
     if hasattr(env.config, 'syntax'):
         if not getattr(env.config.syntax, 'use_figure', True):
